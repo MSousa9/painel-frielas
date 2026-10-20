@@ -5,7 +5,7 @@ com calendário, resultados e classificação de cada escalão do SC Frielas.
 Uso:   python scripts/atualizar.py            (leitura real)
        python scripts/atualizar.py --selftest (testa o leitor com dados de exemplo)
 """
-import json, re, sys, time, datetime, pathlib, urllib.request
+import json, re, sys, time, datetime, pathlib, urllib.request, urllib.error
 from bs4 import BeautifulSoup, NavigableString
 
 # ----------------------------------------------------------------- configuração
@@ -29,7 +29,12 @@ ESCALOES = [
     dict(nome="Benjamins Sub-11 A", id=30338, comp="Liga Sub-11 Futebol de 7", opcional=True),
 ]
 PAUSA = 0.7   # segundos entre pedidos (para não sobrecarregar o site)
-UA = "Mozilla/5.0 (compatible; PainelSCFrielas/1.0; uso pessoal semanal)"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/124.0.0.0 Safari/537.36")
+
+
+class Bloqueado(Exception):
+    """O portal recusou o pedido (403)."""
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 MESES = dict(jan=1, fev=2, mar=3, abr=4, mai=5, jun=6, jul=7, ago=8, set=9, out=10, nov=11, dez=12)
 SIGLAS = {"Fc": "FC", "Cf": "CF", "Cd": "CD", "Sc": "SC", "Ad": "AD", "Ud": "UD", "Gs": "GS",
@@ -41,11 +46,20 @@ def get(path, tentativas=3):
     url = path if path.startswith("http") else BASE + path
     for i in range(tentativas):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "pt-PT,pt;q=0.9"})
+            req = urllib.request.Request(url, headers={
+                "User-Agent": UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
+                "Referer": BASE + "/Competition"})
             with urllib.request.urlopen(req, timeout=40) as r:
                 html = r.read().decode("utf-8", "replace")
             time.sleep(PAUSA)
             return html
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429):
+                raise Bloqueado("O portal recusou o pedido (HTTP %d)." % e.code)
+            print("   aviso:", url, e)
+            time.sleep(3 * (i + 1))
         except Exception as e:
             print("   aviso:", url, e)
             time.sleep(3 * (i + 1))
@@ -212,6 +226,10 @@ def main():
     for cfg in ESCALOES:
         try:
             r = processar(cfg)
+        except Bloqueado as e:
+            print("   BLOQUEADO:", e)
+            print("Paro aqui para não insistir. data.json não foi alterado.")
+            sys.exit(1)
         except Exception as e:
             print("   ERRO:", e)
             r = None
