@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""Lê o portal oficial resultados.fpf.pt (AF Lisboa) e escreve data.json
+com calendário, resultados e classificação de cada escalão do SC Frielas.
+
+Uso:   python scripts/atualizar.py            (leitura real)
+       python scripts/atualizar.py --selftest (testa o leitor com dados de exemplo)
+"""
+import json, re, sys, time, datetime, pathlib, urllib.request, urllib.error
+from bs4 import BeautifulSoup, NavigableString
+
+# ----------------------------------------------------------------- configuração
+BASE = "https://resultados.fpf.pt"
+SEASON_ID = 106            # 2026-2027 no portal da FPF
+SEASON_START = 2026
+CLUBE_NOME = "SC Frielas"  # nome mostrado no painel
+CLUBE_RE = re.compile(r'^(SC\s+)?Frielas(\s+"?[A-Z]"?)?$', re.I)   # nome no portal da FPF
+
+# nome no painel / id da competição no portal / texto do subtítulo
+ESCALOES = [
+    dict(nome="Seniores",           id=29945, comp="CD III Divisão"),
+    dict(nome="Juniores Sub-19",    id=30047, comp="CD III Divisão · Sub-19"),
+    dict(nome="Juvenis Sub-17 A",   id=30061, comp="CD III Divisão · Sub-17"),
+    dict(nome="Iniciados Sub-15 A", id=30062, comp="CD III Divisão · Sub-15"),
+    dict(nome="Infantis Sub-12 A",  id=30335, comp="CD Sub-12 Futebol de 7"),
+    dict(nome="Benjamins Sub-10",   id=30344, comp="Liga Sub-10 Futebol de 7"),
+    # opcionais: só aparecem se o clube for encontrado
+    dict(nome="Infantis Sub-13 A",  id=30334, comp="CD Sub-13 III Divisão", opcional=True),
+    dict(nome="Infantis Sub-13 B",  id=30325, comp="CD Sub-13 Futebol de 7", opcional=True),
+    dict(nome="Benjamins Sub-11 A", id=30338, comp="Liga Sub-11 Futebol de 7", opcional=True),
+]
+PAUSA = 0.7   # segundos entre pedidos (para não sobrecarregar o site)
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/124.0.0.0 Safari/537.36")
+
+
+class Bloqueado(Exception):
+    """O portal recusou o pedido (403)."""
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+MESES = dict(jan=1, fev=2, mar=3, abr=4, mai=5, jun=6, jul=7, ago=8, set=9, out=10, nov=11, dez=12)
+SIGLAS = {"Fc": "FC", "Cf": "CF", "Cd": "CD", "Sc": "SC", "Ad": "AD", "Ud": "UD", "Gs": "GS",
+          "Sad": "SAD", "Sl": "SL", "Udr": "UDR", "Cac": "CAC", "Adceo": "ADCEO", "Gd": "GD"}
+
+
+# ----------------------------------------------------------------- rede
+def get(path, tentativas=3):
+    url = path if path.startswith("http") else BASE + path
+    for i in range(tentativas):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
+                "Referer": BASE + "/Competition"})
+            with urllib.request.urlopen(req, timeout=40) as r:
+                html = r.read().decode("utf-8", "replace")
+            time.sleep(PAUSA)
+            return html
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429):
+                raise Bloqueado("O portal recusou o pedido (HTTP %d)." % e.code)
+            print("   aviso:", url, e)
+            time.sleep(3 * (i + 1))
+        except Exception as e:
+            print("   aviso:", url, e)
+            time.sleep(3 * (i + 1))
+    raise RuntimeError("Não consegui abrir " + url)
+
+
+def guardar_debug(nome, html):
+    d = ROOT / "debug"
+    d.mkdir(exist_ok=True)
+    (d / nome).write_text(html, encoding="utf-8")
+
+
+# ----------------------------------------------------------------- leitura do HTML
+def tokens(html):
+    """HTML -> lista de textos pela ordem da página. Cada ligação a uma jornada
+    ou a um jogo vira um único texto com marcador (§FX..§ / §M..§)."""
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    for a in soup.find_all("a", href=True):
+        txt = " ".join(a.stripped_strings)
+        m = re.search(r"fixtureId=(\d+)", a["href"])
+        if m:
+            a.replace_with(NavigableString("§FX%s§ %s" % (m.group(1), txt)))
+            continue
+        m = re.search(r"matchId=(\d+)", a["href"])
+        if m:
+            a.replace_with(NavigableString("§M%s§ %s" % (m.group(1), txt)))
+    return [re.sub(r"\s+", " ", s).strip() for s in soup.stripped_strings if s.strip()]
+
+
+def blocos(tok):
+    """Separa a página em séries (cada uma com a sua classificação e jornadas)."""
+    out, fase = [], ""
+    cur = dict(fase="", serie="", t=[])
+    for t in tok:
+        if re.match(r"^\d+\s*ª\s*FASE$", t, re.I) or re.match(r"^FASE\s+\w+$", t, re.I):
+            fase = t
+            continue
+        if re.match(r"^S[ÉE]RIE\s+\w+$", t, re.I):
+            if cur["t"]:
+                out.append(cur)
+            cur = dict(fase=fase, serie=t, t=[])
+            continue
+        cur["t"].append(t)
+    if cur["t"]:
+        out.append(cur)
+    return out
+
+
+def classificacao(tok):
+    """Lê a tabela POS JGS V E D GM GS PTS."""
+    if "PTS" not in tok:
+        return []
+    k = tok.index("PTS") + 1
+    rows = []
+    while k < len(tok) and tok[k].isdigit():
+        pos = int(tok[k]); k += 1
+        nome = []
+        while k < len(tok):
+            nxt = tok[k:k + 7]
+            if len(nxt) == 7 and all(x.isdigit() for x in nxt):
+                break
+            nome.append(tok[k]); k += 1
+        if k >= len(tok) or not nome:
+            break
+        n = [int(x) for x in tok[k:k + 7]]; k += 7
+        rows.append(dict(p=pos, t=" ".join(nome), j=n[0], v=n[1], e=n[2], d=n[3], gm=n[4], gs=n[5], pts=n[6]))
+    return rows
+
+
+def para_data(dm):
+    d, m = dm.replace(".", "").split()
+    mes = MESES[m.lower()[:3]]
+    ano = SEASON_START if mes >= 8 else SEASON_START + 1
+    return datetime.date(ano, mes, int(d)).isoformat()
+
+
+def jogos(tok, equipas):
+    """Lê os jogos de uma jornada (realizados e por realizar)."""
+    ordenadas = sorted(equipas, key=len, reverse=True)
+    out = []
+    for i, t in enumerate(tok):
+        m = re.match(r'^§M\d+§ (.+?) (\d+) ?- ?(\d+) (\d{1,2} [A-Za-zç]{3}\.?) (.+)$', t)
+        if m:
+            resto, fora, local = m.group(5), None, ""
+            for nome in ordenadas:
+                if resto == nome or resto.startswith(nome + " "):
+                    fora, local = nome, resto[len(nome):].strip()
+                    break
+            if fora and m.group(1) in equipas:
+                out.append(dict(casa=m.group(1), fora=fora, res="%s-%s" % (m.group(2), m.group(3)),
+                                data=para_data(m.group(4)), hora="", local=local.split(" | ")[0]))
+            continue
+        if re.match(r"^\d{1,2} [A-Za-zç]{3}\.?$", t) and 0 < i < len(tok) - 1:
+            j, hora = i + 1, ""
+            if re.match(r"^\d{1,2}:\d{2}$", tok[j]):
+                hora = tok[j]; j += 1
+            if j >= len(tok):
+                continue
+            casa, fora = tok[i - 1], tok[j]
+            local = tok[j + 1] if j + 1 < len(tok) else ""
+            if casa in equipas and fora in equipas:
+                try:
+                    out.append(dict(casa=casa, fora=fora, res="", data=para_data(t), hora=hora,
+                                    local=local.split(" | ")[0]))
+                except KeyError:
+                    pass
+    return out
+
+
+# ----------------------------------------------------------------- apresentação
+def bonito(nome):
+    if CLUBE_RE.match(nome):
+        resto = re.sub(r"^(SC\s+)?Frielas", "", nome, flags=re.I)
+        return CLUBE_NOME + resto
+    return re.sub(r"\b[A-Za-z]{2,5}\b", lambda m: SIGLAS.get(m.group(0), m.group(0)), nome)
+
+
+def titulo(txt):
+    return re.sub(r"\s+", " ", txt.lower().replace("série", "Série")).strip().capitalize() if txt else ""
+
+
+def processar(cfg):
+    print("•", cfg["nome"])
+    html = get("/Competition/Details?competitionId=%d&seasonId=%d" % (cfg["id"], SEASON_ID))
+    tok = tokens(html)
+    escolhido = None
+    for b in blocos(tok):                                     # a fase mais recente em que o clube aparece
+        tab = classificacao(b["t"])
+        if any(CLUBE_RE.match(r["t"]) for r in tab):
+            escolhido = (b, tab)
+    if not escolhido:
+        guardar_debug("competicao_%d.html" % cfg["id"], html)
+        print("   clube não encontrado (ou sem classificação)")
+        return None
+    b, tab = escolhido
+    equipas = {r["t"] for r in tab}
+    fixtures, vistos = [], set()
+    for t in b["t"]:
+        m = re.match(r"^§FX(\d+)§ (\d+)$", t)
+        if m and m.group(1) not in vistos:
+            vistos.add(m.group(1)); fixtures.append((int(m.group(2)), m.group(1)))
+    lista = []
+    for n, fid in fixtures:
+        tk = tokens(get("/Competition/GetClassificationAndMatchesByFixture?fixtureId=" + fid))
+        for g in jogos(tk, equipas):
+            if CLUBE_RE.match(g["casa"]) or CLUBE_RE.match(g["fora"]):
+                g["jornada"] = "J%d" % n
+                lista.append(g)
+    unicos = {(g["data"], g["casa"], g["fora"]): g for g in lista}
+    final = []
+    for g in sorted(unicos.values(), key=lambda x: (x["data"], x["hora"])):
+        g = dict(g, casa=bonito(g["casa"]), fora=bonito(g["fora"]))
+        final.append(g)
+    sub = " · ".join(x for x in [cfg["comp"], titulo(b["serie"]), "2026/27"] if x)
+    print("   %d jogos, %d equipas na classificação" % (len(final), len(tab)))
+    return dict(nome=cfg["nome"], competicao=sub, jogos=final,
+                classificacao=[dict(r, t=bonito(r["t"])) for r in tab if r["t"].lower() != "isento"])
+
+
+def main():
+    escaloes = []
+    for cfg in ESCALOES:
+        try:
+            r = processar(cfg)
+        except Bloqueado as e:
+            print("   BLOQUEADO:", e)
+            print("Paro aqui para não insistir. data.json não foi alterado.")
+            sys.exit(1)
+        except Exception as e:
+            print("   ERRO:", e)
+            r = None
+        if r:
+            escaloes.append(r)
+        elif not cfg.get("opcional"):
+            print("   (escalão obrigatório sem dados)")
+    if not escaloes:
+        print("Nenhum escalão lido — data.json não foi alterado.")
+        sys.exit(1)
+    destino = ROOT / "data.json"
+    antigo = {}
+    if destino.exists():
+        try:
+            antigo = json.loads(destino.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    novo = dict(clube=CLUBE_NOME, epoca="2026/27", escaloes=escaloes)
+    if {k: v for k, v in antigo.items() if k != "atualizado"} == novo:
+        print("Sem alterações.")
+        return
+    novo["atualizado"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="minutes")
+    destino.write_text(json.dumps(novo, ensure_ascii=False, indent=1), encoding="utf-8")
+    print("data.json atualizado com %d escalões." % len(escaloes))
+
+
+# ----------------------------------------------------------------- teste
+def selftest():
+    pagina = """<div><h2>MKA | CD III DIVISÃO</h2><div>1ª FASE</div><div>SÉRIE 2</div>
+    <div><a href="/Competition/GetClassificationAndMatchesByFixture?fixtureId=654824">1</a>
+    <a href="/Competition/GetClassificationAndMatchesByFixture?fixtureId=654825">2</a></div>
+    <table><tr><th>POS</th><th></th><th>JGS</th><th>V</th><th>E</th><th>D</th><th>GM</th><th>GS</th><th>PTS</th></tr>
+    <tr><td>1</td><td>Castanheira</td><td>5</td><td>5</td><td>0</td><td>0</td><td>21</td><td>4</td><td>15</td></tr>
+    <tr><td>8</td><td><span>Frielas</span></td><td>5</td><td>2</td><td>0</td><td>3</td><td>6</td><td>8</td><td>6</td></tr>
+    <tr><td>9</td><td>Sacavenense "B"</td><td>5</td><td>2</td><td>0</td><td>3</td><td>8</td><td>10</td><td>6</td></tr>
+    <tr><td>10</td><td>Técnico Fc</td><td>5</td><td>5</td><td>0</td><td>0</td><td>15</td><td>1</td><td>15</td></tr>
+    <tr><td>11</td><td>Encarnação Olivais</td><td>5</td><td>0</td><td>0</td><td>5</td><td>2</td><td>23</td><td>0</td></tr>
+    <tr><td>14</td><td>Isento</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td></tr></table>
+    <a href="/Match/GetMatchInformation?matchId=1"><span>Frielas</span> 2 - 0 18 out <span>Encarnação Olivais</span> Campo Da Corredoura</a>
+    <a href="/Match/GetMatchInformation?matchId=2">Técnico Fc 1 - 3 18 out Sacavenense "B" Campo Do Cevadeiro Nº 1</a>
+    <div><div>Castanheira</div><div>25 out<br>15:00</div><div>Frielas</div><div>Campo X | Castanheira</div></div></div>"""
+    tok = tokens(pagina)
+    bl = blocos(tok)
+    assert bl[-1]["serie"] == "SÉRIE 2" and bl[-1]["fase"] == "1ª FASE", bl
+    tab = classificacao(bl[-1]["t"])
+    assert len(tab) == 6 and tab[1]["t"] == "Frielas" and tab[1]["pts"] == 6, tab
+    eq = {r["t"] for r in tab}
+    js = jogos(tok, eq)
+    assert len(js) == 3, js
+    assert js[0]["res"] == "2-0" and js[0]["fora"] == "Encarnação Olivais" and js[0]["local"] == "Campo Da Corredoura", js[0]
+    assert js[1]["fora"] == 'Sacavenense "B"' and js[1]["local"] == "Campo Do Cevadeiro Nº 1", js[1]
+    assert js[2]["hora"] == "15:00" and js[2]["data"] == "2026-10-25" and js[2]["local"] == "Campo X", js[2]
+    assert bonito("Frielas") == "SC Frielas" and bonito("Técnico Fc") == "Técnico FC"
+    print("Teste OK: classificação e jogos lidos corretamente.")
+
+
+if __name__ == "__main__":
+    selftest() if "--selftest" in sys.argv else main()
